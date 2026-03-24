@@ -12,10 +12,15 @@ are left as stubs with docstrings describing expected I/O.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+import sqlite3
+from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 from langgraph.graph import StateGraph, START, END
+
+# SQLite database path (created/seeded on import)
+DB_PATH = Path(__file__).with_name("procurement.db")
 
 
 # ---------------------------
@@ -48,7 +53,7 @@ class GraphState:
     clarification_reason: Optional[str] = None
 
     def log(self, message: str) -> None:
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         self.Audit_Log.append(f"{timestamp} | {message}")
 
 
@@ -56,42 +61,197 @@ class GraphState:
 # Stubbed external tools
 # ---------------------------
 
+
+def init_db() -> None:
+    """Create and seed a local SQLite database for demo purposes."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS budgets (
+            cost_center TEXT PRIMARY KEY,
+            allocated REAL NOT NULL,
+            used REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS approval_matrix (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            min_amount REAL NOT NULL,
+            max_amount REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS restricted_items (
+            category TEXT PRIMARY KEY
+        );
+
+        CREATE TABLE IF NOT EXISTS vendors (
+            vendor_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            contract_ref TEXT,
+            framework_agreement TEXT
+        );
+        """
+    )
+    # Seed only if empty to keep idempotent
+    cur.execute("SELECT COUNT(*) FROM budgets")
+    if cur.fetchone()[0] == 0:
+        cur.executemany(
+            "INSERT INTO budgets(cost_center, allocated, used) VALUES (?, ?, ?)",
+            [
+                ("CC-4200", 20000.0, 5000.0),
+                ("CC-5000", 10000.0, 9000.0),
+            ],
+        )
+
+    cur.execute("SELECT COUNT(*) FROM approval_matrix")
+    if cur.fetchone()[0] == 0:
+        cur.executemany(
+            "INSERT INTO approval_matrix(role, min_amount, max_amount) VALUES (?, ?, ?)",
+            [
+                ("Manager", 0, 5000),
+                ("Director", 5000, 20000),
+                ("CFO", 20000, 1_000_000),
+            ],
+        )
+
+    cur.execute("SELECT COUNT(*) FROM restricted_items")
+    if cur.fetchone()[0] == 0:
+        cur.executemany(
+            "INSERT INTO restricted_items(category) VALUES (?)",
+            [
+                ("Firearms",),
+                ("Explosives",),
+                ("Personal Travel",),
+            ],
+        )
+
+    cur.execute("SELECT COUNT(*) FROM vendors")
+    if cur.fetchone()[0] == 0:
+        cur.executemany(
+            "INSERT INTO vendors(vendor_id, name, active, contract_ref, framework_agreement) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("V-7788", "TechSource", 1, "MSA-123", "FA-9"),
+                ("V-9999", "Blacklisted Co", 0, "NONE", None),
+                ("V-1234", "OfficeSupplies Ltd", 1, "MSA-555", "FA-12"),
+            ],
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_db():
+    return sqlite3.connect(DB_PATH)
+
+# Initialize database on import so demo runs without manual setup.
+init_db()
+
+
 def check_budget_with_erp(budget_code: Dict[str, str], amount: float) -> bool:
     """
-    Placeholder for ERP budget check.
-
     Expected input:
         budget_code: {"cost_center": "...", "funds": "..."}
         amount: numeric amount requested
     Expected output:
         bool indicating if funds are available
     """
-    # Implement integration with ERP or finance microservice here.
-    raise NotImplementedError("Integrate ERP budget check here.")
+    cost_center = budget_code.get("cost_center")
+    if not cost_center:
+        return False
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT allocated, used FROM budgets WHERE cost_center = ?", (cost_center,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return False
+        allocated, used = row
+        available = allocated - used
+        return available >= amount
 
 
 def run_policy_engine(state: GraphState) -> Dict[str, bool]:
     """
-    Placeholder for procurement policy evaluation.
-
     Expected input:
         Full GraphState (thresholds, restricted items, approval matrix)
     Expected output:
         {"compliant": bool, "violation": "reason-if-any"}
     """
-    raise NotImplementedError("Integrate policy engine here.")
+    description = (state.Item_Details.get("description") or "").lower()
+    requested_amount = float(state.Budget_Code.get("requested_amount", 0) or 0)
+
+    with get_db() as conn:
+        cur = conn.cursor()
+
+        # Restricted item check
+        cur.execute("SELECT category FROM restricted_items")
+        for (category,) in cur.fetchall():
+            if category.lower() in description:
+                return {"compliant": False, "violation": f"Restricted item: {category}"}
+
+        # Approval matrix lookup
+        cur.execute(
+            """
+            SELECT role, min_amount, max_amount
+            FROM approval_matrix
+            WHERE ? >= min_amount AND ? < max_amount
+            ORDER BY min_amount ASC
+            LIMIT 1
+            """,
+            (requested_amount, requested_amount),
+        )
+        approval_row = cur.fetchone()
+
+    if not approval_row:
+        return {"compliant": False, "violation": "No approval rule for amount"}
+
+    role, min_amt, max_amt = approval_row
+    state.Approval_Hierarchy = [
+        {
+            "role": role,
+            "min_amount": f"{min_amt}",
+            "max_amount": f"{max_amt}",
+        }
+    ]
+    return {"compliant": True, "violation": ""}
 
 
 def validate_vendor_master(vendor_info: Dict[str, str]) -> Dict[str, bool]:
     """
-    Placeholder for vendor master lookup.
-
     Expected input:
         vendor_info: {"vendor_id": "...", "contract_ref": "..."}
     Expected output:
         {"valid": bool, "reason": "text-if-invalid"}
     """
-    raise NotImplementedError("Integrate vendor validation here.")
+    vendor_id = vendor_info.get("vendor_id")
+    if not vendor_id:
+        return {"valid": False, "reason": "Missing vendor_id"}
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT vendor_id, active, contract_ref FROM vendors WHERE vendor_id = ?",
+            (vendor_id,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return {"valid": False, "reason": "Vendor not found"}
+
+    _, active, contract_ref = row
+    if not active:
+        return {"valid": False, "reason": "Vendor inactive/blocked"}
+
+    requested_contract = vendor_info.get("contract_ref")
+    if requested_contract and requested_contract != contract_ref:
+        return {"valid": False, "reason": "Contract reference mismatch"}
+
+    return {"valid": True, "reason": ""}
 
 
 def send_notification(requester: Dict[str, str], decision: Decision, details: Dict[str, str]) -> None:
@@ -301,7 +461,17 @@ if __name__ == "__main__":
         Delivery_Requirements={"timeline": "2026-05-01", "urgency": "Medium"},
     )
     final_state = graph.invoke(sample_state)
-    print("Decision:", final_state.Decision_Status)
+    decision_status = (
+        final_state.Decision_Status
+        if isinstance(final_state, GraphState)
+        else final_state.get("Decision_Status")
+    )
+    audit = (
+        final_state.Audit_Log
+        if isinstance(final_state, GraphState)
+        else final_state.get("Audit_Log", [])
+    )
+    print("Decision:", decision_status)
     print("Audit trail:")
-    for line in final_state.Audit_Log:
+    for line in audit:
         print(" -", line)
