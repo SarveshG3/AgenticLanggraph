@@ -471,6 +471,7 @@ if __name__ == "__main__":
         if isinstance(final_state, GraphState)
         else final_state.get("Audit_Log", [])
     )
+    print(graph.get_graph().print_ascii())
     print("Decision:", decision_status)
     print("Audit trail:")
     for line in audit:
